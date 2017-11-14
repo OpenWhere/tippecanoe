@@ -10,18 +10,22 @@
 #include <set>
 #include <zlib.h>
 #include <math.h>
+#include <map>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <protozero/pbf_reader.hpp>
+#include <mapbox/geometry/feature.hpp>
 #include "mvt.hpp"
 #include "projection.hpp"
 #include "geometry.hpp"
 #include "write_json.hpp"
+#include "readlayer.h"
 
 int minzoom = 0;
 int maxzoom = 32;
 bool force = false;
+bool merge = false;
 
 void do_stats(mvt_tile &tile, size_t size, bool compressed, int z, unsigned x, unsigned y) {
 	printf("{ \"zoom\": %d, \"x\": %u, \"y\": %u, \"bytes\": %zu, \"compressed\": %s", z, x, y, size, compressed ? "true" : "false");
@@ -49,6 +53,7 @@ void do_stats(mvt_tile &tile, size_t size, bool compressed, int z, unsigned x, u
 
 	printf(" } }\n");
 }
+
 
 void handle(std::string message, int z, unsigned x, unsigned y, int describe, std::set<std::string> const &to_decode, bool pipeline, bool stats) {
 	mvt_tile tile;
@@ -126,6 +131,149 @@ void handle(std::string message, int z, unsigned x, unsigned y, int describe, st
 	if (!pipeline) {
 		printf("] }\n");
 	}
+}
+
+bool load(sqlite3 *db, int z, unsigned x, unsigned y, mvt_tile *tile) {
+	bool was_compressed;
+	bool return_code = true;
+
+    const char *sql = "SELECT tile_data from tiles where zoom_level = ? and tile_column = ? and tile_row = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "select failed: %s\n", sqlite3_errmsg(db));
+        exit(EXIT_FAILURE);
+    }
+
+    sqlite3_bind_int(stmt, 1, z);
+    sqlite3_bind_int(stmt, 2, x);
+    sqlite3_bind_int(stmt, 3, (1LL << z) - 1 - y);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int len = sqlite3_column_bytes(stmt, 0);
+        const char *s = (const char *) sqlite3_column_blob(stmt, 0);
+
+		try {
+            std::string message = std::string(s, len);
+			if (!tile->decode(message, was_compressed)) {
+				fprintf(stderr, "Couldn't parse tile %d/%u/%u\n", z, x, y);
+				return_code = false;
+			}
+		} catch (protozero::unknown_pbf_wire_type_exception e) {
+			fprintf(stderr, "PBF decoding error in tile %d/%u/%u\n", z, x, y);
+			return_code = false;
+		}
+    }
+
+    sqlite3_finalize(stmt);
+	return return_code;
+}
+
+std::string interpret_flags(uint64_t flags) {
+    switch (flags) {
+        case 0: return "On Tile";
+        case 1: return "North";
+        case 2: return "South";
+        case 3: return "North|South";
+        case 4: return "East";
+        case 5: return "North|East";
+        case 6: return "South|East";
+        case 7: return "North|South|East";
+        case 8: return "West";
+        case 9: return "North|West";
+        case 10: return "South|West";
+        case 11: return "North|South|West";
+        case 12: return "East|West";
+        case 13: return "North|East|West";
+        case 14: return "South|East|West";
+        case 15: return "North|South|East|West";
+        default: return "Unknown direction";
+    }
+}
+
+using mapbox::geometry::feature_collection;
+
+using feature_collection_type = feature_collection<long long>;
+
+typedef std::vector<feature_type> feature_vec;
+
+typedef std::map<std::string, feature_vec> layer_map;
+
+layer_map load_feature_map(sqlite3 *db, int z, unsigned x, unsigned y, std::set<std::string> const &to_decode) {
+    mvt_tile tile;
+    layer_map result_map;
+    if ( load(db, z, x, y, &tile) ) {
+        for (size_t l = 0; l < tile.layers.size(); l++) {
+            mvt_layer &layer = tile.layers[l];
+
+            if (to_decode.size() != 0 && !to_decode.count(layer.name)) {
+                continue;
+            }
+
+            std::vector<feature_type> features = layer_to_features(layer, z, x, y);
+            fprintf(stderr, "Extracted %lu %s features,\n", features.size(), layer.name.c_str());
+            result_map[layer.name] = features;
+        }
+    }
+    return result_map;
+}
+
+
+
+void decode_merge(char *fname, int z, unsigned x, unsigned y, std::set<std::string> const &to_decode, bool pipeline, bool stats) {
+	sqlite3 *db;
+
+	int fd = open(fname, O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		struct stat st;
+		if (fstat(fd, &st) == 0) {
+			if (st.st_size < 50 * 1024 * 1024) {
+				char *map = (char *) mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+				if (map != NULL && map != MAP_FAILED) {
+					if (strcmp(map, "SQLite format 3") != 0) {
+						fprintf(stderr, "Not a SQL Lite 3 file, no merge is possible");
+						if (z >= 0) {
+							std::string s = std::string(map, st.st_size);
+							handle(s, z, x, y, 1, to_decode, pipeline, stats);
+							munmap(map, st.st_size);
+							return;
+						} else {
+							fprintf(stderr, "Must specify zoom/x/y to decode a single pbf file\n");
+							exit(EXIT_FAILURE);
+						}
+					}
+				}
+				munmap(map, st.st_size);
+			}
+		} else {
+			perror("fstat");
+		}
+		if (close(fd) != 0) {
+			perror("close");
+			exit(EXIT_FAILURE);
+		}
+	} else {
+		perror(fname);
+	}
+
+	if (sqlite3_open(fname, &db) != SQLITE_OK) {
+		fprintf(stderr, "%s: %s\n", fname, sqlite3_errmsg(db));
+		exit(EXIT_FAILURE);
+	}
+    // TODO: chase features that exceed the tile
+    // Note: The SQLLite database is TMS, the input is assumed to be web-mercator
+    // Write out features within the tile as geojson to stdout
+    // Will need a map of features to prevent higher zooms to overwrite
+    // The assumption is the highest zoom has the most detail
+    // I have confirmed this as new features appear when going up a zoom
+    // like zoom 14 has alleys and side roads
+    // zoom 13 has major roads, etc.
+    layer_map layer_features = load_feature_map(db, z, x, y, to_decode);
+    int num_features = 0;
+
+    for (auto& fiter: layer_features) {
+        num_features += fiter.second.size();
+    }
+    fprintf(stderr, "Extracted %d total features,\n", num_features);
 }
 
 void decode(char *fname, int z, unsigned x, unsigned y, std::set<std::string> const &to_decode, bool pipeline, bool stats) {
@@ -292,7 +440,7 @@ void decode(char *fname, int z, unsigned x, unsigned y, std::set<std::string> co
 }
 
 void usage(char **argv) {
-	fprintf(stderr, "Usage: %s [-s projection] [-Z minzoom] [-z maxzoom] [-l layer ...] file.mbtiles [zoom x y]\n", argv[0]);
+	fprintf(stderr, "Usage: %s [-s projection] [-Z minzoom] [-z maxzoom] [-l layer ...] [-m] file.mbtiles [zoom x y]\n", argv[0]);
 	exit(EXIT_FAILURE);
 }
 
@@ -312,6 +460,7 @@ int main(int argc, char **argv) {
 		{"tag-layer-and-zoom", no_argument, 0, 'c'},
 		{"stats", no_argument, 0, 'S'},
 		{"force", no_argument, 0, 'f'},
+		{"merge", no_argument, 0, 'm'},
 		{0, 0, 0, 0},
 	};
 
@@ -359,14 +508,23 @@ int main(int argc, char **argv) {
 			force = true;
 			break;
 
+			case 'm':
+				merge = true;
+				break;
+
 		default:
 			usage(argv);
 		}
 	}
 
 	if (argc == optind + 4) {
-		decode(argv[optind], atoi(argv[optind + 1]), atoi(argv[optind + 2]), atoi(argv[optind + 3]), to_decode, pipeline, stats);
+		if ( merge ) decode_merge(argv[optind], atoi(argv[optind + 1]), atoi(argv[optind + 2]), atoi(argv[optind + 3]), to_decode, pipeline, stats);
+		else decode(argv[optind], atoi(argv[optind + 1]), atoi(argv[optind + 2]), atoi(argv[optind + 3]), to_decode, pipeline, stats);
 	} else if (argc == optind + 1) {
+		if ( merge ) {
+			fprintf(stderr, "-m (merge) is only valid when decoding a single tile, merge with surrounding");
+			exit(EXIT_FAILURE);
+		}
 		decode(argv[optind], -1, -1, -1, to_decode, pipeline, stats);
 	} else {
 		usage(argv);
