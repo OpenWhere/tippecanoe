@@ -190,18 +190,20 @@ std::string interpret_flags(uint64_t flags) {
     }
 }
 
-using mapbox::geometry::feature_collection;
-
-using feature_collection_type = feature_collection<long long>;
+using mapbox::geometry::point;
+using point_type = point<long long>;
 
 typedef std::vector<feature_type> feature_vec;
 
 typedef std::map<std::string, feature_vec> layer_map;
 
+
 layer_map load_feature_map(sqlite3 *db, int z, unsigned x, unsigned y, std::set<std::string> const &to_decode) {
     mvt_tile tile;
     layer_map result_map;
     if ( load(db, z, x, y, &tile) ) {
+        fprintf(stdout, "{ \"type\": \"FeatureCollection\", \"features\": [\n");
+        bool feature_comma = false;
         for (size_t l = 0; l < tile.layers.size(); l++) {
             mvt_layer &layer = tile.layers[l];
 
@@ -209,14 +211,16 @@ layer_map load_feature_map(sqlite3 *db, int z, unsigned x, unsigned y, std::set<
                 continue;
             }
 
-            std::vector<feature_type> features = layer_to_features(layer, z, x, y);
-            fprintf(stderr, "Extracted %lu %s features,\n", features.size(), layer.name.c_str());
-            result_map[layer.name] = features;
+            feature_vec features = layer_to_features(layer, z, x, y);
+            std::vector<feature_type> remainders = output_within_tile(features, z, x, y, feature_comma);
+            fprintf(stderr, "Extracted %lu %s features, left with %lu that spanned the tile\n", features.size(), layer.name.c_str(), remainders.size());
+
+            result_map[layer.name] = remainders;
         }
+        fprintf(stdout, "\n] }\n");
     }
     return result_map;
 }
-
 
 
 void decode_merge(char *fname, int z, unsigned x, unsigned y, std::set<std::string> const &to_decode, bool pipeline, bool stats) {
@@ -269,6 +273,7 @@ void decode_merge(char *fname, int z, unsigned x, unsigned y, std::set<std::stri
     // zoom 13 has major roads, etc.
     layer_map layer_features = load_feature_map(db, z, x, y, to_decode);
     int num_features = 0;
+
 
     for (auto& fiter: layer_features) {
         num_features += fiter.second.size();
